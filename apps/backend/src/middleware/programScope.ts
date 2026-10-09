@@ -70,45 +70,65 @@ function extractBatchId(req: Request): string | null {
 export function programScope(opts: { required?: boolean } = {}) {
   const required = opts.required ?? false;
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    if (req.programContext) return next(); // already attached
-
-    const batchId = extractBatchId(req);
-    if (!batchId) {
-      if (required) {
-        res.status(400).json({ message: 'batchId is required for this route.' });
-        return;
-      }
-      return next();
-    }
-
     try {
-      const batch = await Batch.findById(batchId).select('_id name isActive').lean();
-      if (!batch) {
-        res.status(404).json({ message: 'Program not found.' });
-        return;
-      }
-      if (!batch.isActive) {
-        res.status(410).json({ message: 'Program is archived or completed.' });
-        return;
-      }
-      req.programContext = {
-        batchId: String(batch._id),
-        batchName: batch.name,
-        isActive: batch.isActive,
-      };
+      // Root-cause fix (2026-09-25): this middleware is mounted BOTH
+      // globally (bootstrap/middleware.ts, before any route-specific
+      // auth middleware runs) AND again per-route after `optionalAuth`/
+      // `protect`. The global pass runs with `req.user` not yet set, so
+      // it could resolve `req.programContext` but never had a user to
+      // attach `req.programEnrollment` for. The old "already attached,
+      // skip" early return then made the per-route pass — the only one
+      // that ever has a real user — skip re-running entirely, so
+      // req.programEnrollment silently never got attached for anyone
+      // whose request happened to reach a global-then-per-route double
+      // invocation (which is every request that reaches a route using
+      // this middleware). That looked exactly like "not enrolled" for
+      // users who very much were.
+      //
+      // Fix: resolving `req.programContext` is still skipped once it
+      // exists (that part of the cache is fine — the batch itself
+      // doesn't change mid-request), but the enrollment attachment is
+      // now independent of that cache and always attempted whenever a
+      // signed-in, non-admin user doesn't have it yet.
+      if (!req.programContext) {
+        const batchId = extractBatchId(req);
+        if (!batchId) {
+          if (required) {
+            res.status(400).json({ message: 'batchId is required for this route.' });
+            return;
+          }
+          return next();
+        }
 
-      setContextBatchId(String(batch._id));
+        const batch = await Batch.findById(batchId).select('_id name isActive').lean();
+        if (!batch) {
+          res.status(404).json({ message: 'Program not found.' });
+          return;
+        }
+        if (!batch.isActive) {
+          res.status(410).json({ message: 'Program is archived or completed.' });
+          return;
+        }
+        req.programContext = {
+          batchId: String(batch._id),
+          batchName: batch.name,
+          isActive: batch.isActive,
+        };
+        setContextBatchId(String(batch._id));
+      }
 
-      // Look up enrollment if the user is signed in. The model
-      // is loaded lazily so this middleware works even before the
-      // ProgramEnrollment model migration is run.
+      // Look up enrollment if the user is signed in and it isn't
+      // already attached. The model is loaded lazily so this
+      // middleware works even before the ProgramEnrollment model
+      // migration is run.
       const userId = (req as Request & { user?: { _id?: string; role?: string } }).user?._id;
-      if (userId && (req as Request & { user?: { role?: string } }).user?.role !== 'admin') {
+      const role = (req as Request & { user?: { role?: string } }).user?.role;
+      if (userId && role !== 'admin' && !req.programEnrollment) {
         try {
           // Dynamic import — keeps the middleware cheap when the
           // model isn't installed yet.
           const { default: ProgramEnrollment } = await import('../modules/program/program-enrollment.model.js');
-          const enr = await ProgramEnrollment.findOne({ userId, batchId, isActive: true }).lean();
+          const enr = await ProgramEnrollment.findOne({ userId, batchId: req.programContext.batchId, isActive: true }).lean();
           if (enr) {
             req.programEnrollment = {
               userId: String(enr.userId),
@@ -144,6 +164,66 @@ export function programScope(opts: { required?: boolean } = {}) {
  *     handler
  *   )
  */
+/**
+ * Blocks a signed-in, non-enrolled user from reading another program's
+ * data via a client-supplied `batchId` — the cross-cohort leak where a
+ * summership-only student could switch the program dropdown to Vriddhi/
+ * Monsoonship and have the backend trust the batchId at face value.
+ *
+ * Deliberately permissive for three cases so it's safe to drop onto
+ * routes that are intentionally public:
+ *   - No signed-in user (`req.user` unset) — anonymous browsing is
+ *     unaffected; there's no session to leak across.
+ *   - No `batchId` was requested (`req.programContext` unset) — an
+ *     unscoped/global read, not a per-program one.
+ *   - Incident fix (2026-09-25): the user has NO `ProgramEnrollment`
+ *     row for ANY batch. `ProgramEnrollment` is only populated by a
+ *     "v2" SSO bridge login (carrying `programSlug`) or an explicit
+ *     self-enroll — most existing students predate both and were
+ *     never backfilled correctly, so requiring a matching row here
+ *     locked real, already-enrolled students out of their own home
+ *     page. A user with ZERO enrollment rows is almost certainly one
+ *     of these unmigrated legacy accounts, not someone actively
+ *     probing another cohort — so they fail OPEN (logged), while a
+ *     user who DOES have at least one active enrollment elsewhere and
+ *     requests a *different* batch still gets blocked below. This is
+ *     a stopgap until enrollment backfill is fixed; the frontend
+ *     (BatchSwitcher hidden for non-admins) and the batch-list filter
+ *     remain the primary barriers in the meantime.
+ * Only global admins (`User.role === 'admin'`, the platform-wide admin
+ * account, not a per-program role) bypass — they're allowed to view any
+ * program. Everyone else, including global moderators, needs a matching,
+ * active `ProgramEnrollment` for the requested batch, which
+ * `programScope()` (mounted before this) is responsible for attaching.
+ *
+ * Mount AFTER `optionalAuth` (or `protect`) and `programScope()`.
+ */
+export function enforceProgramMembership() {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const user = (req as Request & { user?: { _id?: string; role?: string } }).user;
+    if (!user) return next();
+    if (user.role === 'admin') return next();
+    if (!req.programContext) return next();
+    if (!req.programEnrollment) {
+      try {
+        const { default: ProgramEnrollment } = await import('../modules/program/program-enrollment.model.js');
+        const hasAnyEnrollment = await ProgramEnrollment.exists({ userId: user._id, isActive: true });
+        if (!hasAnyEnrollment) {
+          httpLog.warn(`[enforceProgramMembership] allowing unmigrated user ${user._id} into ${req.programContext.batchId} — no ProgramEnrollment rows at all`);
+          return next();
+        }
+      } catch {
+        // ProgramEnrollment model unavailable — same posture as
+        // programScope's own lazy-import fallback: don't block.
+        return next();
+      }
+      res.status(403).json({ message: 'You are not enrolled in this program.' });
+      return;
+    }
+    next();
+  };
+}
+
 export function requireProgramRole(
   ...allowed: Array<ProgramEnrollmentContext['programRole']>
 ) {
